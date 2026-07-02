@@ -1,0 +1,1281 @@
+# =============================================================================
+# PROJETO: Intelligent Document Understanding (IDU)
+# PLATAFORMA: Databricks (Apache Spark + Delta Lake)
+# CIENTISTA DE DADOS: MSc. João Freire Abramowicz
+# INSTITUIÇÃO: Banco Bradesco S.A.
+# LINGUAGEM: Python 3.x + PySpark
+# DATA: 2025
+# VERSÃO: 2.0 (Refatorado e Comentado — AI-GEN Review)
+# =============================================================================
+#
+# OBJETIVO:
+#   Desenvolver uma pipeline de Inteligência Artificial capaz de:
+#     1. Ler documentos PDF nativos e digitalizados (OCR)
+#     2. Extrair e pré-processar texto
+#     3. Classificar documentos por tipo (RG, CNH, Contrato, etc.)
+#     4. Extrair entidades nomeadas (NER): pessoas, CPFs, endereços, datas
+#     5. Gerar embeddings semânticos vetoriais
+#     6. Indexar embeddings no banco vetorial FAISS
+#     7. Realizar busca semântica via LLM (RAG pipeline)
+#     8. Monitorar experimentos com MLflow
+#     9. Gerar dados sintéticos para testes e validação
+#
+# ARQUITETURA (Medallion Architecture):
+#   Bronze  → Documentos brutos (PDFs, imagens)
+#   Silver  → Texto extraído e limpo, entidades identificadas
+#   Gold    → Embeddings, classificações, índice FAISS, resultados LLM
+#
+# ESTRUTURA DE NOTEBOOKS:
+#   01_Instalacao         → Dependências e bibliotecas
+#   02_Importacoes        → Imports organizados por categoria
+#   03_Configuracao       → Sessão Spark, caminhos, parâmetros globais
+#   04_Leitura_Documentos → Leitura de PDFs do Data Lake
+#   05_Preprocessamento   → Limpeza e normalização de texto
+#   06_Extracao_Entidades → NER com SpaCy
+#   07_Classificacao      → Classificação baseada em palavras-chave
+#   08_Embeddings         → Vetorização semântica (SentenceTransformer)
+#   09_FAISS              → Indexação e busca vetorial
+#   10_LangChain          → Chunking para RAG
+#   11_MLFlow             → Rastreamento de experimentos
+#   12_Testes             → Validação e smoke tests
+# =============================================================================
+
+
+# =============================================================================
+# BLOCO 01 — INSTALAÇÃO DAS DEPENDÊNCIAS
+# =============================================================================
+# NOTA: Em Databricks, use %pip install no início do notebook (cell mágica).
+#       Aqui estão documentadas como referência para reprodutibilidade.
+#
+# Dependências de produção (fixar versões em requirements.txt):
+#   reportlab==4.2.x    → Geração de PDFs sintéticos
+#   faker==26.x         → Dados falsos realistas em pt_BR
+#   pandas==2.x         → Manipulação de DataFrames
+#   pyspark==3.5.x      → Processamento distribuído (já presente no Databricks)
+#   numpy==1.26.x       → Operações numéricas e vetoriais
+#   nltk==3.9.x         → Tokenização e stopwords
+#   spacy==3.7.x        → NER (Reconhecimento de Entidades Nomeadas)
+#   sentence-transformers → Embeddings multilíngues
+#   faiss-cpu==1.8.x    → Banco vetorial para busca semântica
+#   langchain==0.2.x    → Orquestração LLM e text splitting
+#   mlflow==2.x         → Rastreamento de experimentos ML
+#   transformers==4.x   → Modelos HuggingFace (LLMs, tokenizers)
+#
+# Para instalar no Databricks, adicionar em uma célula separada:
+%pip install reportlab faker pandas numpy nltk spacy sentence-transformers
+#
+%pip install faiss-cpu langchain langchain-text-splitters mlflow transformers
+
+# =============================================================================
+# BLOCO 02 — IMPORTAÇÃO DAS BIBLIOTECAS
+# =============================================================================
+
+# --- Utilitários do sistema ---
+import os           # Operações de sistema de arquivos (listdir, makedirs, path)
+import random       # Geração de valores aleatórios para dados sintéticos
+import subprocess   # Execução de comandos shell (download de modelos SpaCy)
+import logging      # Registro de logs estruturados em produção
+
+# --- Manipulação de dados ---
+import pandas as pd         # DataFrames em memória (Bronze/Silver layer)
+import numpy as np          # Arrays numéricos para embeddings e operações vetoriais
+
+# --- Processamento distribuído (Databricks / Apache Spark) ---
+from pyspark.sql import SparkSession                    # Contexto distribuído do Spark
+from pyspark.sql import functions as F                  # Funções SQL do Spark (col, lit, etc.)
+from pyspark.sql.types import StructType, StringType    # Tipagem de schema Spark
+
+# --- NLP: Tokenização e stopwords ---
+import nltk
+# NOTA: Downloads necessários apenas na primeira execução.
+#       Em produção, pré-instalar no cluster init script.
+nltk.download("punkt", quiet=True)         # Tokenizador de sentenças
+nltk.download("stopwords", quiet=True)     # Lista de stopwords em português
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+
+# --- NLP: Reconhecimento de Entidades Nomeadas (NER) ---
+import spacy
+# NOTA: O modelo 'pt_core_news_lg' é o maior modelo português do SpaCy.
+#       Alternativa menor e mais rápida: 'pt_core_news_sm'
+#       Em produção, instalar via init script: python -m spacy download pt_core_news_lg
+
+# --- Embeddings semânticos ---
+from sentence_transformers import SentenceTransformer
+# NOTA: 'paraphrase-multilingual-MiniLM-L12-v2' suporta 50+ idiomas,
+#       incluindo pt-BR. Produz embeddings de 384 dimensões.
+#       Alternativa mais robusta: 'paraphrase-multilingual-mpnet-base-v2' (768 dim)
+
+# --- Banco vetorial para busca semântica ---
+import faiss
+# NOTA: faiss-cpu é adequado para protótipos. Para produção com alto volume,
+#       considerar faiss-gpu ou Pinecone / Weaviate como alternativas gerenciadas.
+
+# --- LLM e orquestração RAG ---
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# --- Monitoramento de experimentos ML ---
+import mlflow
+# NOTA: O MLflow no Databricks é integrado nativamente.
+#       Não é necessário configurar servidor externo.
+
+# --- Geração de dados sintéticos ---
+from faker import Faker                     # Dados fictícios realistas em pt_BR
+from reportlab.pdfgen import canvas         # Geração programática de PDFs
+
+# Configuração do logger para rastreabilidade em produção
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("IDU_Bradesco")
+
+logger.info("Todas as bibliotecas importadas com sucesso.")
+
+
+# =============================================================================
+# BLOCO 03 — CONFIGURAÇÃO GLOBAL
+# =============================================================================
+# Centraliza todos os parâmetros e caminhos em um único ponto de controle.
+# Facilita manutenção, versionamento e promoção entre ambientes (dev/prod).
+
+# --- Caminhos do Data Lake (Databricks Workspace) ---
+# NOTA: Em produção, substituir por caminhos no ADLS Gen2 (abfss://)
+#       Ex.: "abfss://bronze@<storage>.dfs.core.windows.net/documentos"
+USUARIO = "joaoabramowicz2019@gmail.com"
+BASE_PATH = f"/Workspace/Users/{USUARIO}/PROJETO - IA_BRADESCO"
+PASTA_DOCUMENTOS = f"{BASE_PATH}/documentos"
+PASTA_DELTA = "clientes"  # Nome da tabela Delta Lake
+
+# --- Parâmetros dos modelos ---
+MODELO_EMBEDDING = "paraphrase-multilingual-MiniLM-L12-v2"
+MODELO_SPACY = "pt_core_news_lg"
+EMBEDDING_DIM = 384         # Dimensão fixa do modelo MiniLM-L12
+CHUNK_SIZE = 500            # Tamanho dos chunks para RAG (em caracteres)
+CHUNK_OVERLAP = 50          # Sobreposição entre chunks para manter contexto
+
+# --- Parâmetros de geração de dados sintéticos ---
+N_DOCUMENTOS_GERAIS = 100   # PDFs com dados de clientes variados
+N_CONTRATOS = 50            # PDFs de contratos bancários
+N_DOCS_VARIADOS = 200       # PDFs com tipos documentais misturados
+N_CLIENTES = 5000           # Registros na base de clientes
+
+# --- Tipos documentais reconhecidos pelo classificador ---
+TIPOS_DOCUMENTOS = [
+    "RG",
+    "CPF",
+    "CNH",
+    "Comprovante de Residência",
+    "Holerite",
+    "Contrato Bancário",
+    "Declaração de Imposto de Renda",
+    "Comprovante de Renda",
+    "Extrato Bancário",
+    "Comprovante PIX",
+    "TED",
+    "DOC",
+    "IRPF"
+]
+
+# --- Configuração do MLflow ---
+MLFLOW_EXPERIMENT = f"/Users/{USUARIO}/Bradesco_DocumentAI"
+
+logger.info(f"Configuração carregada. Pasta de documentos: {PASTA_DOCUMENTOS}")
+
+
+# =============================================================================
+# BLOCO 04 — CRIAÇÃO DA SESSÃO SPARK
+# =============================================================================
+# No Databricks, a SparkSession já está disponível como variável `spark`.
+# Este bloco garante compatibilidade com ambientes locais e CI/CD.
+
+spark = (
+    SparkSession.builder
+    .appName("Bradesco_IDU")                           # Nome visível no Spark UI
+    .config("spark.sql.adaptive.enabled", "true")      # Adaptive Query Execution
+    .config("spark.sql.shuffle.partitions", "200")     # Partições para joins/aggregations
+    .getOrCreate()
+)
+
+# Configura o nível de log do Spark para reduzir verbosidade
+spark.sparkContext.setLogLevel("WARN")
+
+logger.info(f"Spark iniciado. Versão: {spark.version}")
+print(f"✅ Spark {spark.version} iniciado com sucesso.")
+
+
+# =============================================================================
+# BLOCO 05 — CARREGAMENTO DOS MODELOS NLP
+# =============================================================================
+# Carrega e disponibiliza globalmente os modelos de linguagem.
+# O carregamento antecipado evita latência nas etapas subsequentes.
+
+def carregar_modelo_spacy(nome_modelo: str = MODELO_SPACY):
+    """
+    Carrega o modelo SpaCy para português.
+
+    Tenta carregar o modelo especificado. Se não estiver instalado,
+    realiza o download automaticamente via subprocess.
+
+    Args:
+        nome_modelo (str): Nome do modelo SpaCy (default: pt_core_news_lg)
+
+    Returns:
+        spacy.Language: Objeto de pipeline NLP carregado.
+
+    Raises:
+        RuntimeError: Se o download falhar ou o modelo for inválido.
+    """
+    try:
+        nlp = spacy.load(nome_modelo)
+        logger.info(f"Modelo SpaCy '{nome_modelo}' carregado com sucesso.")
+        return nlp
+    except OSError:
+        logger.warning(f"Modelo '{nome_modelo}' não encontrado. Iniciando download...")
+        resultado = subprocess.run(
+            ["python", "-m", "spacy", "download", nome_modelo],
+            capture_output=True, text=True
+        )
+        if resultado.returncode != 0:
+            raise RuntimeError(
+                f"Falha no download do modelo SpaCy.\n"
+                f"STDERR: {resultado.stderr}"
+            )
+        nlp = spacy.load(nome_modelo)
+        logger.info(f"Modelo '{nome_modelo}' baixado e carregado.")
+        return nlp
+
+
+def carregar_modelo_embedding(nome_modelo: str = MODELO_EMBEDDING):
+    """
+    Carrega o modelo SentenceTransformer para geração de embeddings.
+
+    O modelo é baixado automaticamente do HuggingFace Hub na primeira execução
+    e cacheado localmente para execuções subsequentes.
+
+    Args:
+        nome_modelo (str): Identificador do modelo no HuggingFace Hub.
+
+    Returns:
+        SentenceTransformer: Modelo de embeddings pronto para uso.
+    """
+    logger.info(f"Carregando modelo de embeddings: {nome_modelo}")
+    modelo = SentenceTransformer(nome_modelo)
+    logger.info("Modelo de embeddings carregado com sucesso.")
+    return modelo
+
+
+# Carregamento dos modelos (execução na inicialização)
+nlp = carregar_modelo_spacy()
+modelo_embedding = carregar_modelo_embedding()
+
+print("✅ Modelos NLP e Embeddings carregados.")
+
+
+# =============================================================================
+# BLOCO 06 — LEITURA DOS DOCUMENTOS
+# =============================================================================
+# Lê todos os PDFs disponíveis no caminho configurado no Data Lake.
+# NOTA: Em produção, utilizar spark.read com suporte a ADLS Gen2.
+
+def listar_documentos(caminho: str) -> list:
+    """
+    Lista todos os arquivos PDF disponíveis na pasta de documentos.
+
+    Args:
+        caminho (str): Caminho absoluto da pasta no workspace.
+
+    Returns:
+        list[str]: Lista com os nomes dos arquivos encontrados.
+
+    Raises:
+        FileNotFoundError: Se o diretório não existir.
+    """
+    if not os.path.exists(caminho):
+        raise FileNotFoundError(
+            f"Diretório não encontrado: {caminho}\n"
+            f"Execute o BLOCO 13 para gerar os documentos sintéticos."
+        )
+
+    # Filtra apenas arquivos PDF, ignorando subdiretórios e arquivos ocultos
+    arquivos = [
+        f for f in os.listdir(caminho)
+        if f.endswith(".pdf") and not f.startswith(".")
+    ]
+
+    logger.info(f"{len(arquivos)} documentos PDF encontrados em '{caminho}'.")
+    return arquivos
+
+
+# Execução da leitura
+try:
+    documentos = listar_documentos(PASTA_DOCUMENTOS)
+    print(f"✅ {len(documentos)} documentos encontrados.")
+except FileNotFoundError as e:
+    logger.warning(str(e))
+    documentos = []
+    print(f"⚠️  {e}")
+
+
+# =============================================================================
+# BLOCO 07 — PRÉ-PROCESSAMENTO DO TEXTO
+# =============================================================================
+# Pipeline de normalização textual: limpeza, padronização e remoção de ruído.
+# Esta etapa é crítica para a qualidade dos embeddings e da NER.
+
+def limpar_texto(texto: str, remover_stopwords: bool = False) -> str:
+    """
+    Normaliza e limpa o texto extraído de documentos.
+
+    Operações realizadas:
+        1. Conversão para letras minúsculas
+        2. Remoção de quebras de linha e espaços extras
+        3. Strip de espaços nas bordas
+        4. (Opcional) Remoção de stopwords em português
+
+    Args:
+        texto (str): Texto bruto extraído do documento.
+        remover_stopwords (bool): Se True, remove stopwords do português.
+                                  Use apenas para classificação/indexação,
+                                  NÃO para NER (perde contexto gramatical).
+
+    Returns:
+        str: Texto normalizado e limpo.
+
+    Exemplo:
+        >>> limpar_texto("  João Silva\\nCPF 123.456.789-00  ")
+        'joão silva cpf 123.456.789-00'
+    """
+    if not isinstance(texto, str):
+        logger.warning(f"Entrada inválida para limpar_texto: tipo {type(texto)}")
+        return ""
+
+    # Normalização básica
+    texto = texto.lower()           # Padroniza caixa
+    texto = texto.replace("\n", " ") # Remove quebras de linha
+    texto = texto.replace("\r", " ") # Remove carriage returns (Windows)
+    texto = texto.replace("\t", " ") # Remove tabs
+    # Colapsa múltiplos espaços em um único
+    while "  " in texto:
+        texto = texto.replace("  ", " ")
+    texto = texto.strip()           # Remove espaços nas bordas
+
+    # Remoção opcional de stopwords (APENAS para tarefas de classificação/busca)
+    if remover_stopwords:
+        stop_words = set(stopwords.words("portuguese"))
+        tokens = word_tokenize(texto, language="portuguese")
+        tokens_filtrados = [t for t in tokens if t not in stop_words]
+        texto = " ".join(tokens_filtrados)
+
+    return texto
+
+
+# Teste da função de limpeza
+texto_teste = "  João Silva\nCPF 123.456.789-00\nRua XPTO  "
+texto_limpo = limpar_texto(texto_teste)
+print(f"✅ Limpeza de texto OK.\n   Input:  '{texto_teste.strip()}'")
+print(f"   Output: '{texto_limpo}'")
+
+
+# =============================================================================
+# BLOCO 08 — EXTRAÇÃO DE ENTIDADES NOMEADAS (NER)
+# =============================================================================
+# Identifica e extrai entidades relevantes para operações bancárias:
+# Pessoas (PER), Organizações (ORG), Localidades (LOC), Datas (DATE), etc.
+#
+# LABELS SpaCy pt_core_news_lg:
+#   PER  → Pessoas físicas
+#   ORG  → Organizações e empresas
+#   LOC  → Localidades (cidades, estados, países)
+#   MISC → Miscelânea (eventos, produtos, etc.)
+#
+# NOTA: CPF e CNPJ não são reconhecidos nativamente pelo SpaCy.
+#       Para extração de CPF/CNPJ, usar regex complementar (vide função abaixo).
+
+import re  # Necessário para extração de padrões estruturados (CPF, CNPJ, etc.)
+
+# Padrões regex para entidades financeiras estruturadas
+REGEX_CPF = r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}"
+REGEX_CNPJ = r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}"
+REGEX_AGENCIA = r"[Aa]g[eê]ncia[\s:]*(\d{4,5})"
+REGEX_CONTA = r"[Cc]onta[\s:]*(\d{5,10})"
+
+
+def extrair_entidades(texto: str, nlp_model=None) -> dict:
+    """
+    Extrai entidades nomeadas e padrões estruturados de um texto.
+
+    Combina NER do SpaCy com extração por regex para capturar tanto
+    entidades linguísticas (nomes, organizações) quanto dados estruturados
+    (CPF, CNPJ, número de conta bancária).
+
+    Args:
+        texto (str): Texto do documento para análise.
+        nlp_model: Pipeline SpaCy carregado. Usa variável global `nlp` se None.
+
+    Returns:
+        dict: Dicionário com listas de entidades por categoria:
+              {
+                "pessoas": [...],
+                "organizacoes": [...],
+                "localidades": [...],
+                "datas": [...],
+                "cpfs": [...],
+                "cnpjs": [...],
+                "agencias": [...],
+                "contas": [...]
+              }
+
+    Exemplo:
+        >>> resultado = extrair_entidades("João Silva, CPF 123.456.789-00, Recife-PE")
+        >>> resultado["pessoas"]
+        ['João Silva']
+        >>> resultado["cpfs"]
+        ['123.456.789-00']
+    """
+    model = nlp_model or nlp
+
+    # Inicializa dicionário de resultados
+    entidades = {
+        "pessoas": [],
+        "organizacoes": [],
+        "localidades": [],
+        "datas": [],
+        "cpfs": [],
+        "cnpjs": [],
+        "agencias": [],
+        "contas": []
+    }
+
+    if not texto or not texto.strip():
+        logger.warning("Texto vazio passado para extrair_entidades.")
+        return entidades
+
+    # --- Extração via SpaCy NER ---
+    doc = model(texto)
+    for entidade in doc.ents:
+        texto_ent = entidade.text.strip()
+        label = entidade.label_
+
+        if label == "PER":
+            entidades["pessoas"].append(texto_ent)
+        elif label == "ORG":
+            entidades["organizacoes"].append(texto_ent)
+        elif label == "LOC":
+            entidades["localidades"].append(texto_ent)
+        elif label in ("DATE", "TIME"):
+            entidades["datas"].append(texto_ent)
+
+    # --- Extração via Regex (padrões estruturados) ---
+    entidades["cpfs"] = re.findall(REGEX_CPF, texto)
+    entidades["cnpjs"] = re.findall(REGEX_CNPJ, texto)
+    entidades["agencias"] = re.findall(REGEX_AGENCIA, texto)
+    entidades["contas"] = re.findall(REGEX_CONTA, texto)
+
+    # Remove duplicatas mantendo ordem de aparição
+    for chave in entidades:
+        entidades[chave] = list(dict.fromkeys(entidades[chave]))
+
+    logger.debug(f"Entidades extraídas: {entidades}")
+    return entidades
+
+
+# Teste de extração de entidades
+texto_ner = "João Silva\nCPF 123.456.789-00\nRua XPTO, Recife - PE\nAgência: 1234 Conta: 567890"
+resultado_ner = extrair_entidades(texto_ner)
+print("✅ NER executada com sucesso.")
+for categoria, valores in resultado_ner.items():
+    if valores:
+        print(f"   {categoria.upper()}: {valores}")
+
+
+# =============================================================================
+# BLOCO 09 — GERAÇÃO DE EMBEDDINGS
+# =============================================================================
+# Transforma texto em vetores numéricos densos (embeddings) para
+# permitir busca semântica por similaridade.
+#
+# Diferença entre busca por palavras-chave e busca semântica:
+#   - Keyword: "contrato" encontra apenas documentos com a palavra "contrato"
+#   - Semântica: "acordo financeiro" também encontra documentos sobre contratos
+#
+# O modelo 'paraphrase-multilingual-MiniLM-L12-v2' produz:
+#   - Vetores de 384 dimensões
+#   - Suporte a mais de 50 idiomas (incluindo pt-BR)
+#   - Boa performance em tarefas de similaridade semântica
+
+def gerar_embedding(texto: str, modelo=None) -> np.ndarray:
+    """
+    Gera o vetor de embedding para um texto usando SentenceTransformer.
+
+    Args:
+        texto (str): Texto a ser vetorizado. Máx. ~512 tokens (truncado automaticamente).
+        modelo: Instância do SentenceTransformer. Usa `modelo_embedding` global se None.
+
+    Returns:
+        np.ndarray: Array de float32 com shape (EMBEDDING_DIM,).
+                    Retorna array de zeros em caso de texto inválido.
+    """
+    m = modelo or modelo_embedding
+
+    if not texto or not texto.strip():
+        logger.warning("Texto vazio — retornando embedding zero-vector.")
+        return np.zeros(EMBEDDING_DIM, dtype="float32")
+
+    # encode() aceita string ou lista de strings
+    # normalize_embeddings=True → L2 normalização (útil para cosine similarity)
+    embedding = m.encode(texto, normalize_embeddings=True)
+    return embedding.astype("float32")
+
+
+def gerar_embeddings_batch(textos: list, modelo=None, batch_size: int = 32) -> np.ndarray:
+    """
+    Gera embeddings para uma lista de textos em batch (mais eficiente).
+
+    Args:
+        textos (list[str]): Lista de textos para vetorizar.
+        modelo: Instância SentenceTransformer (usa global se None).
+        batch_size (int): Tamanho do batch para inferência. Ajustar conforme GPU/CPU.
+
+    Returns:
+        np.ndarray: Matriz de shape (len(textos), EMBEDDING_DIM).
+    """
+    m = modelo or modelo_embedding
+    embeddings = m.encode(
+        textos,
+        batch_size=batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=len(textos) > 100  # Exibe barra apenas para grandes volumes
+    )
+    return embeddings.astype("float32")
+
+
+# Teste de geração de embedding
+texto_embedding = "Contrato Bancário de Abertura de Conta"
+embedding_teste = gerar_embedding(texto_embedding)
+print(f"✅ Embedding gerado com sucesso.")
+print(f"   Texto: '{texto_embedding}'")
+print(f"   Shape: {embedding_teste.shape} | Dtype: {embedding_teste.dtype}")
+print(f"   Norma L2: {np.linalg.norm(embedding_teste):.4f} (deve ser ≈ 1.0 se normalizado)")
+
+
+# =============================================================================
+# BLOCO 10 — CHUNKING (LangChain Text Splitter)
+# =============================================================================
+# Divide documentos longos em fragmentos (chunks) menores para alimentar
+# o pipeline RAG (Retrieval-Augmented Generation) com o LLM.
+#
+# Por que dividir em chunks?
+#   LLMs têm janela de contexto limitada (ex: 4k, 8k, 32k tokens).
+#   Documentos bancários podem ter dezenas de páginas.
+#   Chunks com sobreposição preservam contexto entre fragmentos adjacentes.
+#
+# Parâmetros:
+#   chunk_size=500    → ~80-100 palavras por chunk (bom para documentos bancários)
+#   chunk_overlap=50  → 10% de sobreposição para não perder contexto entre chunks
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
+    # Separadores em ordem de prioridade: parágrafo > linha > frase > palavra
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+
+
+def dividir_em_chunks(texto: str) -> list:
+    """
+    Divide um texto longo em chunks menores para processamento RAG.
+
+    Usa RecursiveCharacterTextSplitter do LangChain, que tenta dividir
+    no nível mais natural (parágrafos → linhas → frases → palavras).
+
+    Args:
+        texto (str): Texto completo do documento.
+
+    Returns:
+        list[str]: Lista de chunks de texto com sobreposição configurada.
+
+    Exemplo:
+        >>> chunks = dividir_em_chunks(texto_longo)
+        >>> print(f"{len(chunks)} chunks gerados, média de {sum(len(c) for c in chunks)//len(chunks)} chars/chunk")
+    """
+    if not texto or not texto.strip():
+        return []
+
+    chunks = splitter.split_text(texto)
+    logger.debug(f"Texto dividido em {len(chunks)} chunks (chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
+    return chunks
+
+
+# Teste do splitter
+texto_longo = """
+CONTRATO DE ABERTURA DE CONTA CORRENTE
+
+Cláusula 1 - Das Partes
+O BANCO BRADESCO S.A., inscrito no CNPJ sob o nº 60.746.948/0001-12,
+doravante denominado BANCO, e o Cliente identificado neste instrumento.
+
+Cláusula 2 - Do Objeto
+O presente contrato tem por objeto a abertura e manutenção de conta corrente
+em nome do Cliente, com todos os serviços bancários associados.
+
+Cláusula 3 - Das Obrigações
+O Cliente compromete-se a manter saldo suficiente para cobertura de débitos
+automáticos e encargos previstos neste contrato.
+"""
+
+chunks_teste = dividir_em_chunks(texto_longo)
+print(f"✅ Text splitting OK. {len(chunks_teste)} chunk(s) gerado(s).")
+for i, chunk in enumerate(chunks_teste):
+    print(f"   Chunk {i+1}: {len(chunk)} caracteres")
+
+
+# =============================================================================
+# BLOCO 11 — BANCO VETORIAL FAISS
+# =============================================================================
+# FAISS (Facebook AI Similarity Search) armazena e indexa embeddings para
+# recuperação eficiente por similaridade vetorial.
+#
+# Tipos de índice FAISS:
+#   IndexFlatL2    → Busca exata por distância Euclidiana (L2). Mais preciso,
+#                    mais lento para grandes volumes. OK para < 1M documentos.
+#   IndexFlatIP    → Produto interno (equivale a cosine similarity com vetores normalizados)
+#   IndexIVFFlat   → Busca aproximada (ANN). Mais rápido para grandes volumes.
+#
+# Recomendação para produção com > 100k documentos: usar IndexIVFFlat ou IndexHNSW.
+
+def criar_indice_faiss(dimensao: int = EMBEDDING_DIM) -> faiss.Index:
+    """
+    Cria e retorna um índice FAISS vazio para busca por distância L2.
+
+    Para vetores normalizados (L2 norm = 1), distância L2 e produto interno
+    são equivalentes, portanto IndexFlatL2 com normalize_embeddings=True
+    é equivalente a cosine similarity.
+
+    Args:
+        dimensao (int): Dimensão dos vetores de embedding (default: 384 para MiniLM).
+
+    Returns:
+        faiss.IndexFlatL2: Índice FAISS pronto para receber vetores.
+    """
+    indice = faiss.IndexFlatL2(dimensao)
+    logger.info(f"Índice FAISS criado. Dimensão: {dimensao}. Total vetores: {indice.ntotal}")
+    return indice
+
+
+def adicionar_ao_indice(indice: faiss.Index, embeddings: np.ndarray) -> faiss.Index:
+    """
+    Adiciona embeddings ao índice FAISS.
+
+    Args:
+        indice (faiss.Index): Índice FAISS existente.
+        embeddings (np.ndarray): Array de shape (N, dim) com float32.
+
+    Returns:
+        faiss.Index: Índice atualizado com os novos vetores.
+    """
+    # Garante que os embeddings estão no formato correto
+    embeddings_f32 = np.array(embeddings, dtype="float32")
+
+    # Reshape se for um único vetor (1D → 2D)
+    if embeddings_f32.ndim == 1:
+        embeddings_f32 = embeddings_f32.reshape(1, -1)
+
+    indice.add(embeddings_f32)
+    logger.info(f"{len(embeddings_f32)} vetor(es) adicionado(s). Total no índice: {indice.ntotal}")
+    return indice
+
+
+def buscar_similares(
+    indice: faiss.Index,
+    consulta: str,
+    modelo=None,
+    k: int = 5
+) -> tuple:
+    """
+    Realiza busca semântica por similaridade no índice FAISS.
+
+    Vetoriza a consulta e encontra os k documentos mais similares
+    usando distância L2 (equivalente a cosine similarity com vetores normalizados).
+
+    Args:
+        indice (faiss.Index): Índice FAISS populado com embeddings.
+        consulta (str): Texto da consulta em linguagem natural.
+        modelo: Modelo SentenceTransformer (usa global se None).
+        k (int): Número de resultados mais similares a retornar.
+
+    Returns:
+        tuple: (distancias, indices) onde:
+               - distancias: array (1, k) com as distâncias L2
+               - indices: array (1, k) com os índices dos docs mais similares
+
+    Exemplo:
+        >>> D, I = buscar_similares(index, "Qual o CPF do cliente?", k=3)
+        >>> print(f"Documento mais similar: índice {I[0][0]}, distância {D[0][0]:.4f}")
+    """
+    if indice.ntotal == 0:
+        logger.error("Índice FAISS está vazio. Adicione documentos antes de buscar.")
+        return np.array([[]]), np.array([[]])
+
+    # Gera embedding da consulta
+    embedding_consulta = gerar_embedding(consulta, modelo)
+    embedding_consulta = embedding_consulta.reshape(1, -1)  # FAISS requer 2D
+
+    # Limita k ao número de documentos disponíveis
+    k_efetivo = min(k, indice.ntotal)
+
+    distancias, indices = indice.search(embedding_consulta, k_efetivo)
+
+    logger.info(f"Busca semântica: '{consulta[:50]}...' → {k_efetivo} resultado(s)")
+    return distancias, indices
+
+
+# Criação e população do índice FAISS de demonstração
+index = criar_indice_faiss()
+
+# Textos de exemplo representando documentos do banco
+corpus_exemplo = [
+    "Contrato Bancário de Abertura de Conta Corrente",
+    "Holerite com comprovante de renda mensal",
+    "RG - Registro Geral com foto do portador",
+    "CPF - Cadastro de Pessoa Física emitido pela Receita Federal",
+    "Comprovante de residência - conta de luz Recife PE"
+]
+
+# Gera embeddings em batch e indexa
+embeddings_corpus = gerar_embeddings_batch(corpus_exemplo)
+index = adicionar_ao_indice(index, embeddings_corpus)
+
+# Teste de busca semântica
+consulta_teste = "Qual o CPF do cliente?"
+D, I = buscar_similares(index, consulta_teste, k=3)
+
+print(f"\n✅ Busca semântica FAISS OK.")
+print(f"   Consulta: '{consulta_teste}'")
+print(f"   Resultados (índice → distância → documento):")
+for rank, (idx, dist) in enumerate(zip(I[0], D[0])):
+    print(f"     #{rank+1}: [{idx}] dist={dist:.4f} → '{corpus_exemplo[idx]}'")
+
+
+# =============================================================================
+# BLOCO 12 — CLASSIFICADOR DE DOCUMENTOS
+# =============================================================================
+# Classifica documentos por tipo com base em palavras-chave.
+#
+# LIMITAÇÕES DA ABORDAGEM ATUAL (keyword-based):
+#   - Baixa precisão com variações ortográficas e sinônimos
+#   - Sem probabilidade de confiança por classe
+#   - Não detecta múltiplos tipos em um documento
+#
+# EVOLUÇÃO RECOMENDADA PARA PRODUÇÃO:
+#   - Usar LayoutLM / LayoutLMv3: processa layout + texto simultaneamente
+#   - Usar BERT multilíngue fine-tuned no corpus do banco
+#   - Implementar classificador probabilístico com threshold de confiança
+#   - Adicionar categoria "DESCONHECIDO" para documentos não classificados
+
+# Mapeamento expandido: tipo → lista de termos indicadores
+KEYWORDS_POR_TIPO = {
+    "RG": ["registro geral", "carteira de identidade", "rg", "ssp", "sspds"],
+    "CPF": ["cpf", "cadastro de pessoa física", "receita federal"],
+    "CNH": ["carteira nacional de habilitação", "cnh", "habilitação", "detran"],
+    "Comprovante de Residência": ["comprovante de residência", "conta de luz", "conta de água", "iptu"],
+    "Holerite": ["holerite", "contracheque", "folha de pagamento", "salário líquido"],
+    "Contrato Bancário": ["contrato bancário", "abertura de conta", "limite de crédito", "agência"],
+    "Declaração de Imposto de Renda": ["declaração de imposto de renda", "irpf", "receita federal"],
+    "Comprovante de Renda": ["comprovante de renda", "renda mensal", "rendimento"],
+    "Extrato Bancário": ["extrato bancário", "saldo disponível", "extrato de conta"],
+    "Comprovante PIX": ["pix", "chave pix", "transferência instantânea"],
+    "TED": ["ted", "transferência eletrônica disponível"],
+    "DOC": ["doc", "documento de ordem de crédito"]
+}
+
+
+def classificar_documento(texto: str, keywords_map: dict = None) -> dict:
+    """
+    Classifica o tipo documental com base em palavras-chave.
+
+    Percorre o mapeamento de tipos → keywords e pontua cada tipo
+    pelo número de termos encontrados no texto. Retorna o tipo com
+    maior pontuação como classificação principal.
+
+    Args:
+        texto (str): Texto do documento (preferencialmente já limpo/normalizado).
+        keywords_map (dict): Mapeamento tipo → lista de keywords.
+                             Usa KEYWORDS_POR_TIPO global se None.
+
+    Returns:
+        dict: {
+            "tipo": str,         # Classificação principal
+            "confianca": float,  # Score normalizado (0.0 a 1.0)
+            "todos_scores": dict # Score de cada tipo para análise
+        }
+        Retorna tipo "DESCONHECIDO" se nenhuma keyword for encontrada.
+
+    Exemplo:
+        >>> resultado = classificar_documento("Carteira Nacional de Habilitação DETRAN")
+        >>> resultado["tipo"]
+        'CNH'
+    """
+    kmap = keywords_map or KEYWORDS_POR_TIPO
+    texto_normalizado = texto.lower()
+
+    scores = {}
+    for tipo, keywords in kmap.items():
+        # Conta quantas keywords do tipo aparecem no texto
+        hits = sum(1 for kw in keywords if kw.lower() in texto_normalizado)
+        if hits > 0:
+            scores[tipo] = hits
+
+    if not scores:
+        return {
+            "tipo": "DESCONHECIDO",
+            "confianca": 0.0,
+            "todos_scores": {}
+        }
+
+    # Tipo com maior número de keywords encontradas
+    tipo_principal = max(scores, key=scores.get)
+    max_score = scores[tipo_principal]
+    total_keywords = len(kmap[tipo_principal])
+
+    return {
+        "tipo": tipo_principal,
+        "confianca": round(max_score / total_keywords, 2),  # Score normalizado
+        "todos_scores": scores
+    }
+
+
+# Testes do classificador
+casos_teste = [
+    "Carteira Nacional de Habilitação DETRAN Pernambuco",
+    "CPF 123.456.789-00 Cadastro Pessoa Física Receita Federal",
+    "CONTRATO BANCÁRIO Abertura de Conta Agência 1234",
+    "Documento sem informação reconhecível xyz abc"
+]
+
+print("\n✅ Classificador de documentos OK.")
+for texto_cls in casos_teste:
+    resultado_cls = classificar_documento(texto_cls)
+    print(f"   '{texto_cls[:45]}...'")
+    print(f"   → Tipo: {resultado_cls['tipo']} (confiança: {resultado_cls['confianca']})")
+
+
+# =============================================================================
+# BLOCO 13 — MONITORAMENTO COM MLFLOW
+# =============================================================================
+# Registra parâmetros, métricas e artefatos do experimento para
+# rastreabilidade, reprodutibilidade e comparação entre runs.
+#
+# O MLflow no Databricks é integrado nativamente ao workspace.
+# Acesse via: Experiments → Bradesco_DocumentAI
+
+def registrar_experimento_mlflow(
+    modelo_nome: str,
+    n_documentos: int,
+    n_chunks: int,
+    n_entidades: int,
+    dimensao_embedding: int
+):
+    """
+    Registra os metadados de uma execução do pipeline IDU no MLflow.
+
+    Parâmetros registrados:
+        - modelo_embedding: Identificador do modelo de embeddings
+        - dimensao_embedding: Dimensão dos vetores gerados
+        - chunk_size / chunk_overlap: Configuração do text splitter
+
+    Métricas registradas:
+        - total_documentos: Documentos processados na run
+        - total_chunks: Chunks gerados para RAG
+        - total_entidades: Entidades NER extraídas
+
+    Args:
+        modelo_nome (str): Nome do modelo SentenceTransformer utilizado.
+        n_documentos (int): Total de documentos processados.
+        n_chunks (int): Total de chunks gerados.
+        n_entidades (int): Total de entidades extraídas.
+        dimensao_embedding (int): Dimensão dos vetores de embedding.
+    """
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+    with mlflow.start_run(run_name="IDU_Pipeline_v2"):
+
+        # --- Parâmetros (hiperparâmetros e configurações fixas) ---
+        mlflow.log_param("modelo_embedding", modelo_nome)
+        mlflow.log_param("modelo_nlp", MODELO_SPACY)
+        mlflow.log_param("dimensao_embedding", dimensao_embedding)
+        mlflow.log_param("chunk_size", CHUNK_SIZE)
+        mlflow.log_param("chunk_overlap", CHUNK_OVERLAP)
+
+        # --- Métricas (valores quantitativos monitoráveis) ---
+        mlflow.log_metric("total_documentos", n_documentos)
+        mlflow.log_metric("total_chunks", n_chunks)
+        mlflow.log_metric("total_entidades", n_entidades)
+        mlflow.log_metric("vetores_no_indice_faiss", index.ntotal)
+
+        logger.info("Experimento registrado no MLflow com sucesso.")
+        print("✅ Experimento registrado no MLflow.")
+
+
+# Execução do registro (com valores de exemplo)
+registrar_experimento_mlflow(
+    modelo_nome=MODELO_EMBEDDING,
+    n_documentos=len(documentos),
+    n_chunks=len(chunks_teste),
+    n_entidades=sum(len(v) for v in resultado_ner.values()),
+    dimensao_embedding=EMBEDDING_DIM
+)
+
+
+# =============================================================================
+# BLOCO 14 — GERAÇÃO DE DADOS SINTÉTICOS (PDFs de Documentos)
+# =============================================================================
+# Gera 100 PDFs simulando documentos bancários reais com dados fictícios.
+# Dados gerados com Faker pt_BR são estatisticamente realistas mas não reais.
+#
+# AVISO DE CONFORMIDADE (LGPD / Política de Dados):
+#   Todos os dados são FICTÍCIOS e gerados por Faker.
+#   Não contêm dados pessoais reais de clientes.
+#   Adequados para testes, treinamento de modelos e validação de pipelines.
+
+def gerar_documentos_sinteticos(
+    pasta: str,
+    n: int = N_DOCUMENTOS_GERAIS,
+    tipos: list = None,
+    faker_instance: Faker = None
+) -> list:
+    """
+    Gera N documentos PDF sintéticos simulando diferentes tipos documentais bancários.
+
+    Cada PDF contém:
+        - Tipo documental aleatório (RG, CNH, Holerite, etc.)
+        - Nome fictício (gerado por Faker pt_BR)
+        - CPF fictício válido quanto ao formato
+        - Endereço fictício no padrão brasileiro
+        - Telefone e email fictícios
+        - Renda mensal aleatória entre R$ 1.800 e R$ 25.000
+
+    Args:
+        pasta (str): Caminho para salvar os PDFs gerados.
+        n (int): Quantidade de documentos a gerar (default: 100).
+        tipos (list): Lista de tipos documentais. Usa TIPOS_DOCUMENTOS global se None.
+        faker_instance (Faker): Instância Faker. Cria nova pt_BR se None.
+
+    Returns:
+        list[str]: Lista com os caminhos dos PDFs gerados.
+
+    Raises:
+        OSError: Se não for possível criar a pasta de destino.
+    """
+    fake = faker_instance or Faker("pt_BR")
+    tipos_docs = tipos or TIPOS_DOCUMENTOS
+    caminhos_gerados = []
+
+    # Garante que o diretório de destino existe
+    os.makedirs(pasta, exist_ok=True)
+    logger.info(f"Gerando {n} documentos sintéticos em: {pasta}")
+
+    for i in range(n):
+        # Dados fictícios do cliente
+        nome = fake.name()
+        cpf = fake.cpf()
+        endereco = fake.address().replace("\n", " ")  # Remove quebras de linha no endereço
+        telefone = fake.phone_number()
+        email = fake.email()
+        salario = round(random.uniform(1800, 25000), 2)
+        tipo = random.choice(tipos_docs)
+
+        # Geração do PDF
+        caminho_pdf = f"{pasta}/Documento_{i+1:04d}.pdf"  # Padding com zeros para ordenação
+        pdf = canvas.Canvas(caminho_pdf)
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(40, 820, "BRADESCO - DOCUMENTO SINTÉTICO (DADOS FICTÍCIOS)")
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(40, 800, f"Tipo Documento : {tipo}")
+        pdf.drawString(40, 775, f"Nome           : {nome}")
+        pdf.drawString(40, 750, f"CPF            : {cpf}")
+        pdf.drawString(40, 725, f"Endereço       : {endereco[:60]}")  # Trunca endereço longo
+        pdf.drawString(40, 700, f"Telefone       : {telefone}")
+        pdf.drawString(40, 675, f"E-mail         : {email}")
+        pdf.drawString(40, 650, f"Renda Mensal   : R$ {salario:,.2f}")
+        pdf.drawString(40, 600, f"[Gerado automaticamente — MSc. João Freire Abramowicz]")
+        pdf.save()
+
+        caminhos_gerados.append(caminho_pdf)
+
+    logger.info(f"{len(caminhos_gerados)} documentos sintéticos gerados com sucesso.")
+    return caminhos_gerados
+
+
+# Execução: geração dos documentos
+print("\n⏳ Gerando documentos sintéticos...")
+arquivos_gerados = gerar_documentos_sinteticos(PASTA_DOCUMENTOS)
+print(f"✅ {len(arquivos_gerados)} PDFs gerados em '{PASTA_DOCUMENTOS}'.")
+
+
+# =============================================================================
+# BLOCO 15 — BASE DE CLIENTES SINTÉTICA
+# =============================================================================
+# Gera 5.000 registros de clientes fictícios para testes de pipeline.
+# Dados são persistidos no Delta Lake como tabela `clientes`.
+
+fake_global = Faker("pt_BR")  # Instância reutilizada para performance
+
+
+def gerar_clientes(n: int = N_CLIENTES, faker_instance: Faker = None) -> pd.DataFrame:
+    """
+    Gera um DataFrame Pandas com N clientes fictícios.
+
+    Schema gerado:
+        id         (int)   : Identificador sequencial único
+        nome       (str)   : Nome completo fictício em pt_BR
+        cpf        (str)   : CPF no formato XXX.XXX.XXX-XX
+        email      (str)   : E-mail fictício
+        telefone   (str)   : Telefone no padrão brasileiro
+        cidade     (str)   : Cidade fictícia brasileira
+        estado     (str)   : Sigla do estado (UF)
+        profissao  (str)   : Profissão fictícia
+        salario    (float) : Salário entre R$ 1.500 e R$ 40.000
+
+    Args:
+        n (int): Quantidade de clientes a gerar (default: 5000).
+        faker_instance (Faker): Instância Faker pt_BR.
+
+    Returns:
+        pd.DataFrame: DataFrame com N linhas e 9 colunas.
+    """
+    fake = faker_instance or fake_global
+    logger.info(f"Gerando base de {n} clientes sintéticos...")
+
+    registros = [
+        {
+            "id": i,
+            "nome": fake.name(),
+            "cpf": fake.cpf(),
+            "email": fake.email(),
+            "telefone": fake.phone_number(),
+            "cidade": fake.city(),
+            "estado": fake.state_abbr(),
+            "profissao": fake.job(),
+            "salario": round(random.uniform(1500, 40000), 2)
+        }
+        for i in range(n)
+    ]
+
+    df = pd.DataFrame(registros)
+    logger.info(f"Base de clientes gerada: {df.shape[0]} registros, {df.shape[1]} colunas.")
+    return df
+
+
+# Geração da base de clientes
+df_clientes = gerar_clientes()
+print(f"✅ Base de clientes gerada: {df_clientes.shape[0]:,} registros.")
+display(df_clientes.head(5))
+
+
+# =============================================================================
+# BLOCO 16 — PROCESSAMENTO DISTRIBUÍDO COM SPARK
+# =============================================================================
+# Converte o DataFrame Pandas em Spark DataFrame para processamento escalável.
+# Necessário para persistência no Delta Lake (formato colunar otimizado).
+
+# Converte Pandas → Spark DataFrame
+spark_df_clientes = spark.createDataFrame(df_clientes)
+
+# Exibe schema inferido automaticamente pelo Spark
+print("\n✅ Spark DataFrame criado.")
+spark_df_clientes.printSchema()
+print(f"   Partições: {spark_df_clientes.rdd.getNumPartitions()}")
+display(spark_df_clientes.limit(5))
+
+
+# =============================================================================
+# BLOCO 17 — PERSISTÊNCIA NO DELTA LAKE
+# =============================================================================
+# Salva os dados no formato Delta Lake para consultas SQL e MLflow.
+# Delta Lake oferece: ACID transactions, time travel, schema evolution.
+
+(
+    spark_df_clientes
+    .write
+    .format("delta")               # Formato Delta Lake (padrão Databricks)
+    .mode("overwrite")             # Substitui dados existentes na tabela
+    .option("overwriteSchema", "true")  # Permite alteração de schema
+    .saveAsTable(PASTA_DELTA)      # Persiste como tabela gerenciada no Metastore
+)
+
+# Validação: lê de volta para confirmar a escrita
+contagem = spark.table(PASTA_DELTA).count()
+print(f"✅ Dados persistidos no Delta Lake: tabela '{PASTA_DELTA}' com {contagem:,} registros.")
+
+
+# =============================================================================
+# BLOCO 18 — GERAÇÃO DE CONTRATOS BANCÁRIOS SINTÉTICOS
+# =============================================================================
+
+def gerar_contratos(pasta: str, n: int = N_CONTRATOS, faker_instance: Faker = None) -> list:
+    """
+    Gera N contratos bancários sintéticos em formato PDF.
+
+    Cada contrato contém:
+        - Nome do cliente fictício
+        - CPF fictício
+        - Número de agência (4 dígitos aleatórios)
+        - Número de conta (6 dígitos aleatórios)
+        - Limite de crédito (entre R$ 3.000 e R$ 80.000)
+        - Data de assinatura fictícia
+        - Bloco para assinatura
+
+    Args:
+        pasta (str): Diretório de destino dos PDFs.
+        n (int): Quantidade de contratos (default: 50).
+        faker_instance (Faker): Instância Faker pt_BR.
+
+    Returns:
+        list[str]: Caminhos dos PDFs gerados.
+    """
+    fake = faker_instance or fake_global
+    os.makedirs(pasta, exist_ok=True)
+    gerados = []
+
+    for i in range(n):
+        contrato_texto = f"""
+CONTRATO DE ABERTURA DE CONTA CORRENTE — Nº {i+1:04d}
+
+BANCO BRADESCO S.A. | CNPJ: 60.746.948/0001-12
+
+DADOS DO CLIENTE:
+  Nome    : {fake.name()}
+  CPF     : {fake.cpf()}
+
+DADOS DA CONTA:
+  Agência : {random.randint(1000, 9999)}
+  Conta   : {random.randint(100000, 999999)}-{random.randint(0, 9)}
+
+CONDIÇÕES FINANCEIRAS:
+  Limite de Crédito : R$ {round(random.uniform(3000, 80000), 2):,.2f}
+  Modalidade        : Conta Corrente Pessoa Física
+
+DATA DE ASSINATURA: {fake.date()}
+
+ASSINATURA DO CLIENTE: ____________________
+
+ASSINATURA DO GERENTE: ____________________
+
+[DOCUMENTO SINTÉTICO — DADOS FICTÍCIOS — João Freire Abramowicz]
+"""
+        caminho_pdf = f"{pasta}/Contrato_{i+1:04d}.pdf"
+        pdf = canvas.Canvas(caminho_pdf)
+        pdf.setFont("Helvetica", 11)
+        y = 820
+
+        for linha in contrato_texto.strip().split("\n"):
+            pdf.drawString(40, y, linha)
+            y -= 18  # Espaçamento entre linhas
+
+            # Nova página se o conteúdo ultrapassar a margem inferior
+            if y < 50:
+                pdf.showPage()
+                pdf.setFont("Helvetica", 11)
+                y = 820
+
+        pdf.save()
+        gerados.append(caminho_pdf)
+
+    logger.info(f"{len(gerados)} contratos bancários gerados.")
+    return gerados
+
+
+contratos = gerar_contratos(PASTA_DOCUMENTOS)
+print(f"✅ {len(contratos)} contratos bancários gerados.")
+
+
+# =============================================================================
+# BLOCO 19 — GERAÇÃO DE DOCUMENTOS VARIADOS
+# =============================================================================
+# Gera 200 PDFs com tipos misturados para simular a heterogeneidade
+# do acervo documental real de um banco de varejo.
+
+TODOS_TIPOS_DOCUMENTOS = [
+    "RG", "CPF", "CNH", "Comprovante de Residência", "IRPF",
+    "Holerite", "Contrato Bancário", "Extrato Bancário",
+    "Comprovante PIX", "TED", "DOC"
+]
+
+
+def gerar_documentos_variados(
+    pasta: str,
+    n: int = N_DOCS_VARIADOS,
+    tipos: list = None,
+    faker_instance: Faker = None
+) -> list:
+    """
+    Gera N documentos PDF com tipos documentais variados.
+
+    Args:
+        pasta (str): Diretório de destino.
+        n (int): Quantidade de documentos (default: 200).
+        tipos (list): Tipos disponíveis para escolha aleatória.
+        faker_instance (Faker): Instância Faker pt_BR.
+
+    Returns:
+        list[str]: Caminhos dos PDFs gerados.
+    """
+    fake = faker_instance or fake_global
+    tipos_docs = tipos or TODOS_TIPOS_DOCUMENTOS
+    os.makedirs(pasta, exist_ok=True)
+    gerados = []
+
+    for i in range(n):
+        tipo = random.choice(tipos_docs)
+        caminho_pdf = f"{pasta}/{tipo.replace(' ', '_')}_{i+1:04d}.pdf"
+        pdf = canvas.Canvas(caminho_pdf)
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(40, 820, f"BRADESCO — {tipo.upper()}")
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(40, 790, f"Documento : {tipo}")
+        pdf.drawString(40, 765, f"Nome      : {fake.name()}")
+        pdf.drawString(40, 740, f"CPF       : {fake.cpf()}")
+        pdf.drawString(40, 715, f"Valor     : R$ {round(random.uniform(100, 50000), 2):,.2f}")
+        pdf.drawString(40, 690, f"Data      : {fake.date()}")
+        pdf.drawString(40, 640, "[DOCUMENTO SINTÉTICO — João Freire Abramowicz]")
+        pdf.save()
+        gerados.append(caminho_pdf)
+
+    logger.info(f"{len(gerados)} documentos variados gerados.")
+    return gerados
+
+
+docs_variados = gerar_documentos_variados(PASTA_DOCUMENTOS)
+print(f"✅ {len(docs_variados)} documentos variados gerados.")
+
+
+# =============================================================================
+# BLOCO 20 — SUMÁRIO FINAL E VALIDAÇÃO DO PIPELINE
+# =============================================================================
+
+print("\n" + "="*65)
+print("  IDU — Intelligent Document Understanding | RESUMO FINAL")
+print("="*65)
+
+sumario = {
+    "Clientes na base Delta Lake": f"{contagem:,}",
+    "PDFs de documentos gerais": f"{len(arquivos_gerados):,}",
+    "Contratos bancários": f"{len(contratos):,}",
+    "Documentos variados": f"{len(docs_variados):,}",
+    "Total de PDFs gerados": f"{len(arquivos_gerados) + len(contratos) + len(docs_variados):,}",
+    "Vetores no índice FAISS": f"{index.ntotal:,}",
+    "Dimensão dos embeddings": f"{EMBEDDING_DIM}",
+    "Modelo NLP": MODELO_SPACY,
+    "Modelo Embeddings": MODELO_EMBEDDING,
+}
+
+for chave, valor in sumario.items():
+    print(f"  {chave:<35}: {valor}")
+
+print("="*65)
+print("  Pipeline IDU executado com sucesso!")
+print("  Cientista de Dados: MSc. João Freire Abramowicz")
+print("="*65)
+
