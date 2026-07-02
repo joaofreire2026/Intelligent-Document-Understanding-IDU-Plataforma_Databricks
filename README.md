@@ -61,8 +61,6 @@
 #   mlflow==2.x         → Rastreamento de experimentos ML
 #   transformers==4.x   → Modelos HuggingFace (LLMs, tokenizers)
 #
-# Para instalar no Databricks, adicionar em uma célula separada:
-#   %pip install reportlab faker pandas numpy nltk spacy sentence-transformers
-#   %pip install faiss-cpu langchain langchain-text-splitters mlflow transformers
+
 
 
